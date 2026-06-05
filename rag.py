@@ -1,41 +1,74 @@
 #!/usr/bin/env python3
 """
-paper-rag — a tiny, fully-local RAG over your own PDFs.
+paper-rag — a tiny, fully-local RAG over your own PDFs (hybrid search + reranking).
 
 Stack (all local, nothing leaves the machine):
-  BGE-M3 embeddings (via Ollama) + Qdrant (embedded, no server) + a local LLM (via Ollama) + pypdf.
+  BGE-M3 dense embeddings (via Ollama) + BM25 sparse (fastembed) + Qdrant (embedded)
+  + a cross-encoder reranker (fastembed) + a local LLM (via Ollama) + pypdf.
+
+Retrieval: dense and sparse hits are fused (Reciprocal Rank Fusion) into a candidate
+pool, then a cross-encoder reranks them and the best passages go to the LLM for a cited
+answer. If fastembed isn't installed it falls back to dense-only (no sparse, no rerank).
 
 Quick start:
-  pip install pypdf qdrant-client
+  pip install pypdf qdrant-client fastembed
   ollama pull bge-m3
   ollama pull qwen3:8b          # or any chat model; set RAG_LLM to override
-  python rag.py ingest ./papers # a folder of PDFs (or individual files)
+  python rag.py ingest ./papers
   python rag.py ask "your question"
 
 Config via env (all optional):
-  OLLAMA_URL  (default http://127.0.0.1:11434)
+  OLLAMA_URL  (default http://127.0.0.1:11434)  — point at any host running Ollama
   RAG_EMBED   (default bge-m3)
-  RAG_LLM     (default qwen3:8b)   — any Ollama chat model
+  RAG_LLM     (default qwen3:8b)
   RAG_DB      (default ./rag_qdrant)
-  RAG_EMBED_TIMEOUT (default 120)  — per-request seconds before an embed call is retried
+  RAG_RERANK  (default Xenova/ms-marco-MiniLM-L-6-v2) — any fastembed cross-encoder
+  RAG_SPARSE  (default Qdrant/bm25)
+  RAG_NUM_CTX (default 8192)  — caps the LLM context so big-native-context models stay on-GPU
+  RAG_EMBED_TIMEOUT (default 120)
 
-Ingest is resumable: progress is saved per batch, so if embedding stalls you can
-just re-run the same `ingest` and it picks up where it stopped.
+Ingest is resumable: progress is saved per batch, so re-running picks up where it stopped.
 """
 import os, sys, json, glob, re, time, urllib.request, hashlib
 
 from pypdf import PdfReader
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
+from qdrant_client.models import (Distance, VectorParams, SparseVectorParams,
+    PointStruct, SparseVector, Prefetch, FusionQuery, Fusion)
 
-OLLAMA      = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
-EMBED_MODEL = os.environ.get("RAG_EMBED", "bge-m3")          # 1024-dim, multilingual
-LLM_MODEL   = os.environ.get("RAG_LLM",   "qwen3:8b")        # any Ollama chat model
-QDRANT_PATH = os.environ.get("RAG_DB",    "./rag_qdrant")
-COLLECTION  = "papers"
-DIM         = 1024
-CHUNK, OVERLAP, TOPK, BATCH = 1400, 200, 5, 16
-EMBED_TIMEOUT = int(os.environ.get("RAG_EMBED_TIMEOUT", "120"))   # fail fast instead of hanging forever
+OLLAMA       = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
+EMBED_MODEL  = os.environ.get("RAG_EMBED", "bge-m3")          # 1024-dim, multilingual
+LLM_MODEL    = os.environ.get("RAG_LLM",   "qwen3:8b")        # any Ollama chat model
+QDRANT_PATH  = os.environ.get("RAG_DB",    "./rag_qdrant")
+RERANK_MODEL = os.environ.get("RAG_RERANK","Xenova/ms-marco-MiniLM-L-6-v2")
+SPARSE_MODEL = os.environ.get("RAG_SPARSE","Qdrant/bm25")
+NUM_CTX      = int(os.environ.get("RAG_NUM_CTX", "8192"))     # cap KV cache -> stay fully on GPU
+EMBED_TIMEOUT= int(os.environ.get("RAG_EMBED_TIMEOUT", "120"))
+COLLECTION   = "papers"
+DIM          = 1024
+CHUNK, OVERLAP, BATCH = 1400, 200, 16
+PREFETCH, TOPK = 20, 5          # hybrid candidate pool -> rerank -> passages sent to the LLM
+DENSE, SPARSE  = "dense", "sparse"
+
+# Optional hybrid (sparse retrieval + cross-encoder rerank); degrade to dense-only if absent.
+try:
+    from fastembed import SparseTextEmbedding
+    from fastembed.rerank.cross_encoder import TextCrossEncoder
+    HYBRID = True
+except Exception:
+    HYBRID = False
+
+_sparse = _reranker = None
+def sparse_model():
+    global _sparse
+    if _sparse is None: _sparse = SparseTextEmbedding(SPARSE_MODEL)
+    return _sparse
+def reranker():
+    global _reranker
+    if _reranker is None: _reranker = TextCrossEncoder(RERANK_MODEL)
+    return _reranker
+def _sv(o):                                       # fastembed sparse output -> Qdrant SparseVector
+    return SparseVector(indices=[int(i) for i in o.indices], values=[float(v) for v in o.values])
 
 
 def _post(path, payload, timeout=600):
@@ -66,7 +99,7 @@ def llm(system, user):
     out = _post("/api/chat", {
         "model": LLM_MODEL, "think": False, "stream": False,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        "options": {"num_predict": 600, "temperature": 0.2},
+        "options": {"num_predict": 600, "temperature": 0.2, "num_ctx": NUM_CTX},
     })
     return out.get("message", {}).get("content", "").strip()
 
@@ -74,7 +107,9 @@ def llm(system, user):
 def client():
     c = QdrantClient(path=QDRANT_PATH)
     if COLLECTION not in [x.name for x in c.get_collections().collections]:
-        c.create_collection(COLLECTION, vectors_config=VectorParams(size=DIM, distance=Distance.COSINE))
+        c.create_collection(COLLECTION,
+            vectors_config={DENSE: VectorParams(size=DIM, distance=Distance.COSINE)},
+            sparse_vectors_config={SPARSE: SparseVectorParams()})   # present even in dense-only mode
     return c
 
 
@@ -95,6 +130,7 @@ def ingest(paths):
     for p in paths:
         files += sorted(glob.glob(os.path.join(p, "*.pdf"))) if os.path.isdir(p) else [p]
     c, n, fresh = client(), 0, 0
+    sm = sparse_model() if HYBRID else None
     for f in files:
         name = os.path.basename(f)
         try:
@@ -109,34 +145,54 @@ def ingest(paths):
             ids = [_pid(name, pg, ch, b) for pg, ch in batch]
             if len(c.retrieve(COLLECTION, ids=ids)) == len(ids):     # resume: batch already stored -> skip
                 n += len(batch); continue
-            vecs = embed([ch for _, ch in batch])
-            pts = [PointStruct(id=i, vector=v, payload={"text": ch, "source": name, "page": pg})
-                   for i, (pg, ch), v in zip(ids, batch, vecs)]
+            texts = [ch for _, ch in batch]
+            dvecs = embed(texts)
+            svecs = list(sm.embed(texts)) if HYBRID else [None] * len(texts)
+            pts = []
+            for i, (pg, ch), dv, sv in zip(ids, batch, dvecs, svecs):
+                vec = {DENSE: dv}
+                if HYBRID: vec[SPARSE] = _sv(sv)
+                pts.append(PointStruct(id=i, vector=vec, payload={"text": ch, "source": name, "page": pg}))
             c.upsert(COLLECTION, pts)                                 # persist each batch -> a stall never loses earlier work
             n += len(batch); fresh += len(batch)
         print(f"  + {name}: {len(chunks)} chunks")
-    print(f"Indexed {n} chunks from {len(files)} file(s) ({fresh} newly embedded) -> {QDRANT_PATH}")
+    print(f"Indexed {n} chunks from {len(files)} file(s) ({fresh} newly embedded) -> {QDRANT_PATH}"
+          + ("  [hybrid: dense+sparse+rerank]" if HYBRID else "  [dense-only: pip install fastembed for hybrid+rerank]"))
 
 
 def ask(question):
     c = client()
-    hits = c.query_points(COLLECTION, query=embed(question)[0], limit=TOPK).points
-    if not hits:
-        print("No matches - ingest some PDFs first."); return
+    if HYBRID:
+        qd = embed(question)[0]
+        qs = _sv(next(sparse_model().query_embed(question)))
+        cand = c.query_points(COLLECTION,                            # dense + sparse, fused by RRF
+            prefetch=[Prefetch(query=qd, using=DENSE,  limit=PREFETCH),
+                      Prefetch(query=qs, using=SPARSE, limit=PREFETCH)],
+            query=FusionQuery(fusion=Fusion.RRF), limit=PREFETCH).points
+        if not cand:
+            print("No matches - ingest some PDFs first."); return
+        scores = list(reranker().rerank(question, [h.payload["text"] for h in cand]))   # cross-encoder rerank
+        ranked = sorted(zip(cand, scores), key=lambda x: x[1], reverse=True)[:TOPK]
+    else:
+        pts = c.query_points(COLLECTION, query=embed(question)[0], using=DENSE, limit=TOPK).points
+        if not pts:
+            print("No matches - ingest some PDFs first."); return
+        ranked = [(h, h.score) for h in pts]
     ctx = "\n\n".join(f"[{i+1}] ({h.payload['source']} p.{h.payload['page']}) {h.payload['text']}"
-                      for i, h in enumerate(hits))
+                      for i, (h, _) in enumerate(ranked))
     system = ("You are a research assistant. Answer using ONLY the provided context excerpts. "
               "Cite sources inline as [n]. If the context lacks the answer, say so plainly.")
     t = time.time()
     print("\n" + llm(system, f"CONTEXT:\n{ctx}\n\nQUESTION: {question}") + "\n\nSources:")
-    for i, h in enumerate(hits):
-        print(f"  [{i+1}] {h.payload['source']} p.{h.payload['page']}  (score {h.score:.3f})")
-    print(f"\n({time.time()-t:.1f}s, fully local - nothing left this machine)")
+    for i, (h, s) in enumerate(ranked):
+        print(f"  [{i+1}] {h.payload['source']} p.{h.payload['page']}  ({'rerank' if HYBRID else 'score'} {s:.3f})")
+    print(f"\n({time.time()-t:.1f}s, {'hybrid+rerank' if HYBRID else 'dense'}, fully local - nothing left this machine)")
 
 
 def stats():
     info = client().get_collection(COLLECTION)
-    print(f"Collection '{COLLECTION}': {info.points_count} chunks, dim {DIM}, at {QDRANT_PATH}")
+    print(f"Collection '{COLLECTION}': {info.points_count} chunks, dim {DIM}, at {QDRANT_PATH} "
+          f"({'hybrid' if HYBRID else 'dense-only'})")
 
 
 if __name__ == "__main__":

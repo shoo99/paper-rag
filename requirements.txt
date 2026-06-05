@@ -1,2 +1,3 @@
 pypdf
 qdrant-client
+fastembed   # optional: enables hybrid (BM25 sparse) retrieval + cross-encoder reranking; without it, dense-only
