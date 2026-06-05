@@ -52,6 +52,37 @@ Sources:
 (14s, hybrid+rerank, fully local - nothing left this machine)
 ```
 
+## Use it from any MCP client (Claude Desktop, Claude Code, Cursor)
+
+`mcp_server.py` exposes the corpus as [MCP](https://modelcontextprotocol.io) tools, so an agent can search and cite *your* papers:
+
+- **`search_papers(query, k)`** — hybrid + reranked passages with `{source, page}` citations, **no LLM** (let the client's own model reason over them).
+- **`ask_papers(question)`** — retrieve + answer with your **local** LLM, inline `[n]` citations.
+- **`corpus_stats()`** — index size and retrieval mode.
+
+```bash
+pip install mcp
+python rag.py ingest ./papers     # ingest first (CLI), then start the server
+python mcp_server.py
+```
+
+Point your client at it (Claude Desktop `claude_desktop_config.json`, or a project `.mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "paper-rag": {
+      "command": "python",
+      "args": ["/abs/path/to/mcp_server.py"],
+      "env": { "RAG_DB": "/abs/path/to/rag_qdrant",
+               "OLLAMA_URL": "http://127.0.0.1:11434", "RAG_LLM": "qwen3:8b" }
+    }
+  }
+}
+```
+
+Your corpus never leaves the machine — only the tool calls and answers cross to the client. (Embedded Qdrant is single-process: ingest with the server stopped, then serve.)
+
 ## How it works
 
 - **Chunking** — PDFs → text (`pypdf`) → ~1400-char overlapping chunks, tagged with source + page.

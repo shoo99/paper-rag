@@ -104,13 +104,16 @@ def llm(system, user):
     return out.get("message", {}).get("content", "").strip()
 
 
+_qc = None
 def client():
-    c = QdrantClient(path=QDRANT_PATH)
-    if COLLECTION not in [x.name for x in c.get_collections().collections]:
-        c.create_collection(COLLECTION,
-            vectors_config={DENSE: VectorParams(size=DIM, distance=Distance.COSINE)},
-            sparse_vectors_config={SPARSE: SparseVectorParams()})   # present even in dense-only mode
-    return c
+    global _qc
+    if _qc is None:                                   # cache one embedded client (reused across MCP calls)
+        _qc = QdrantClient(path=QDRANT_PATH)
+        if COLLECTION not in [x.name for x in _qc.get_collections().collections]:
+            _qc.create_collection(COLLECTION,
+                vectors_config={DENSE: VectorParams(size=DIM, distance=Distance.COSINE)},
+                sparse_vectors_config={SPARSE: SparseVectorParams()})   # present even in dense-only mode
+    return _qc
 
 
 def chunk(text):
@@ -160,7 +163,8 @@ def ingest(paths):
           + ("  [hybrid: dense+sparse+rerank]" if HYBRID else "  [dense-only: pip install fastembed for hybrid+rerank]"))
 
 
-def ask(question):
+def retrieve(question, k=TOPK):
+    """Top-k passages for a question (hybrid dense+sparse + rerank, or dense-only). Returns a list of dicts."""
     c = client()
     if HYBRID:
         qd = embed(question)[0]
@@ -170,22 +174,36 @@ def ask(question):
                       Prefetch(query=qs, using=SPARSE, limit=PREFETCH)],
             query=FusionQuery(fusion=Fusion.RRF), limit=PREFETCH).points
         if not cand:
-            print("No matches - ingest some PDFs first."); return
+            return []
         scores = list(reranker().rerank(question, [h.payload["text"] for h in cand]))   # cross-encoder rerank
-        ranked = sorted(zip(cand, scores), key=lambda x: x[1], reverse=True)[:TOPK]
+        ranked = sorted(zip(cand, scores), key=lambda x: x[1], reverse=True)[:k]
     else:
-        pts = c.query_points(COLLECTION, query=embed(question)[0], using=DENSE, limit=TOPK).points
-        if not pts:
-            print("No matches - ingest some PDFs first."); return
+        pts = c.query_points(COLLECTION, query=embed(question)[0], using=DENSE, limit=k).points
         ranked = [(h, h.score) for h in pts]
-    ctx = "\n\n".join(f"[{i+1}] ({h.payload['source']} p.{h.payload['page']}) {h.payload['text']}"
-                      for i, (h, _) in enumerate(ranked))
+    return [{"text": h.payload["text"], "source": h.payload["source"],
+             "page": h.payload["page"], "score": round(float(s), 4)} for h, s in ranked]
+
+
+def answer(question):
+    """Retrieve, then have the local LLM answer with [n] citations. Returns {'answer': str, 'sources': [...]}."""
+    hits = retrieve(question)
+    if not hits:
+        return {"answer": "No matches - ingest some PDFs first.", "sources": []}
+    ctx = "\n\n".join(f"[{i+1}] ({h['source']} p.{h['page']}) {h['text']}" for i, h in enumerate(hits))
     system = ("You are a research assistant. Answer using ONLY the provided context excerpts. "
               "Cite sources inline as [n]. If the context lacks the answer, say so plainly.")
+    ans = llm(system, f"CONTEXT:\n{ctx}\n\nQUESTION: {question}")
+    sources = [{"n": i + 1, "source": h["source"], "page": h["page"], "score": h["score"]}
+               for i, h in enumerate(hits)]
+    return {"answer": ans, "sources": sources}
+
+
+def ask(question):
     t = time.time()
-    print("\n" + llm(system, f"CONTEXT:\n{ctx}\n\nQUESTION: {question}") + "\n\nSources:")
-    for i, (h, s) in enumerate(ranked):
-        print(f"  [{i+1}] {h.payload['source']} p.{h.payload['page']}  ({'rerank' if HYBRID else 'score'} {s:.3f})")
+    r = answer(question)
+    print("\n" + r["answer"] + "\n\nSources:")
+    for s in r["sources"]:
+        print(f"  [{s['n']}] {s['source']} p.{s['page']}  ({'rerank' if HYBRID else 'score'} {s['score']:.3f})")
     print(f"\n({time.time()-t:.1f}s, {'hybrid+rerank' if HYBRID else 'dense'}, fully local - nothing left this machine)")
 
 

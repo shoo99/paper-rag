@@ -1,3 +1,4 @@
 pypdf
 qdrant-client
 fastembed   # optional: enables hybrid (BM25 sparse) retrieval + cross-encoder reranking; without it, dense-only
+mcp         # optional: only for mcp_server.py (expose the corpus to MCP clients like Claude Desktop)
