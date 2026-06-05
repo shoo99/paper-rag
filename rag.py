@@ -17,6 +17,10 @@ Config via env (all optional):
   RAG_EMBED   (default bge-m3)
   RAG_LLM     (default qwen3:8b)   — any Ollama chat model
   RAG_DB      (default ./rag_qdrant)
+  RAG_EMBED_TIMEOUT (default 120)  — per-request seconds before an embed call is retried
+
+Ingest is resumable: progress is saved per batch, so if embedding stalls you can
+just re-run the same `ingest` and it picks up where it stopped.
 """
 import os, sys, json, glob, re, time, urllib.request, hashlib
 
@@ -30,7 +34,8 @@ LLM_MODEL   = os.environ.get("RAG_LLM",   "qwen3:8b")        # any Ollama chat m
 QDRANT_PATH = os.environ.get("RAG_DB",    "./rag_qdrant")
 COLLECTION  = "papers"
 DIM         = 1024
-CHUNK, OVERLAP, TOPK = 1400, 200, 5
+CHUNK, OVERLAP, TOPK, BATCH = 1400, 200, 5, 16
+EMBED_TIMEOUT = int(os.environ.get("RAG_EMBED_TIMEOUT", "120"))   # fail fast instead of hanging forever
 
 
 def _post(path, payload, timeout=600):
@@ -40,10 +45,20 @@ def _post(path, payload, timeout=600):
         return json.loads(r.read())
 
 
-def embed(texts):
+def embed(texts, tries=3):
     if isinstance(texts, str):
         texts = [texts]
-    return _post("/api/embed", {"model": EMBED_MODEL, "input": texts})["embeddings"]
+    for k in range(tries):                       # embedders can stall under load; fail fast + retry, don't hang
+        try:
+            return _post("/api/embed", {"model": EMBED_MODEL, "input": texts}, timeout=EMBED_TIMEOUT)["embeddings"]
+        except Exception as e:
+            if k == tries - 1:
+                raise SystemExit(
+                    f"\nEmbedding failed after {tries} tries: {e}\n"
+                    f"'{EMBED_MODEL}' is likely stuck (a known Ollama hiccup under sustained load).\n"
+                    f"Fix: `ollama stop {EMBED_MODEL}` and re-run; on WSL, `wsl --shutdown` then re-run.\n"
+                    f"Progress is saved per batch — re-running the same ingest resumes where it stopped.")
+            time.sleep(2 * (k + 1))
 
 
 def llm(system, user):
@@ -71,11 +86,15 @@ def chunk(text):
     return [c for c in out if len(c) > 60]
 
 
+def _pid(name, pg, ch, b):                        # deterministic id -> upserts are idempotent, so ingest can resume
+    return int(hashlib.md5(f"{name}:{pg}:{ch[:40]}:{b}".encode()).hexdigest()[:15], 16)
+
+
 def ingest(paths):
     files = []
     for p in paths:
-        files += glob.glob(os.path.join(p, "*.pdf")) if os.path.isdir(p) else [p]
-    c, pts, n = client(), [], 0
+        files += sorted(glob.glob(os.path.join(p, "*.pdf"))) if os.path.isdir(p) else [p]
+    c, n, fresh = client(), 0, 0
     for f in files:
         name = os.path.basename(f)
         try:
@@ -85,16 +104,18 @@ def ingest(paths):
         chunks = [(pg, ch) for pg, t in pages for ch in chunk(t)]
         if not chunks:
             print(f"  ! {name}: no extractable text (scanned PDF?)"); continue
-        for b in range(0, len(chunks), 16):
-            batch = chunks[b:b + 16]
-            for (pg, ch), v in zip(batch, embed([ch for _, ch in batch])):
-                pid = int(hashlib.md5(f"{name}:{pg}:{ch[:40]}:{b}".encode()).hexdigest()[:15], 16)
-                pts.append(PointStruct(id=pid, vector=v, payload={"text": ch, "source": name, "page": pg}))
-            n += len(batch)
+        for b in range(0, len(chunks), BATCH):
+            batch = chunks[b:b + BATCH]
+            ids = [_pid(name, pg, ch, b) for pg, ch in batch]
+            if len(c.retrieve(COLLECTION, ids=ids)) == len(ids):     # resume: batch already stored -> skip
+                n += len(batch); continue
+            vecs = embed([ch for _, ch in batch])
+            pts = [PointStruct(id=i, vector=v, payload={"text": ch, "source": name, "page": pg})
+                   for i, (pg, ch), v in zip(ids, batch, vecs)]
+            c.upsert(COLLECTION, pts)                                 # persist each batch -> a stall never loses earlier work
+            n += len(batch); fresh += len(batch)
         print(f"  + {name}: {len(chunks)} chunks")
-    for b in range(0, len(pts), 256):
-        c.upsert(COLLECTION, pts[b:b + 256])
-    print(f"Indexed {n} chunks from {len(files)} file(s) -> {QDRANT_PATH}")
+    print(f"Indexed {n} chunks from {len(files)} file(s) ({fresh} newly embedded) -> {QDRANT_PATH}")
 
 
 def ask(question):

@@ -64,12 +64,41 @@ Sources:
 | `RAG_EMBED` | `bge-m3` | embedding model |
 | `RAG_LLM` | `qwen3:8b` | any Ollama chat model |
 | `RAG_DB` | `./rag_qdrant` | vector DB folder |
+| `RAG_EMBED_TIMEOUT` | `120` | seconds before an embed request is retried |
 
 ## Notes from building it (the things that bit me)
 
 - **Reasoning models hide the answer.** If your LLM emits a `<think>` block, its answer can come back empty. This uses `"think": false` so you get the final answer, not the chain-of-thought.
 - **Qdrant's API moved.** Recent `qdrant-client` uses `query_points()`, not the old `search()`.
 - **Embedded Qdrant is underrated** — you get the real engine without standing up a server; perfect for a single-machine private tool.
+- **Embedders can stall under load.** On some setups (notably older GPUs and WSL) a long ingest can make the embedding model hang. So `ingest` saves progress **per batch** with deterministic IDs: if it stalls, re-run the same command and it resumes — and a stuck embed call fails fast (see [Troubleshooting](#troubleshooting)) instead of hanging forever.
+
+## Troubleshooting
+
+**`ingest` hangs, or an embed call times out.** The embedding model (in Ollama) has stalled — a known hiccup under sustained load, especially on older GPUs or under WSL. Fix:
+
+```bash
+ollama stop bge-m3                # unload the stuck model
+python rag.py ingest ./papers     # re-run the SAME ingest — it resumes where it stopped
+```
+
+On **WSL**, if Ollama or even `nvidia-smi` won't respond at all (the GPU is wedged), reset the VM from Windows PowerShell, then re-run the ingest:
+
+```powershell
+wsl --shutdown
+```
+
+Nothing is lost — already-embedded batches are on disk, so the re-run only embeds what's left.
+
+**If it keeps wedging, run the embedder on CPU** (the real fix on some setups — notably older Pascal GPUs under WSL, where the *embedding* model can repeatedly hang the GPU). The embedder is tiny (~1 GB), so pin it to CPU and keep your LLM on the GPU:
+
+```bash
+printf 'FROM bge-m3\nPARAMETER num_gpu 0\n' > bge-m3-cpu.Modelfile
+ollama create bge-m3-cpu -f bge-m3-cpu.Modelfile
+RAG_EMBED=bge-m3-cpu python rag.py ingest ./papers     # embeddings on CPU, answers still on the GPU
+```
+
+CPU embedding is plenty fast for a personal library (~100 chunks in well under a minute) and sidesteps the GPU hang entirely.
 
 ## Honest limitations
 
