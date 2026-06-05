@@ -1,6 +1,6 @@
 # paper-rag — a private, fully-local RAG over your own papers
 
-Ask questions about your own PDF library in natural language, get **cited** answers, **fully offline** — nothing leaves your machine. **Hybrid retrieval (dense + sparse) with cross-encoder reranking**, ~230 lines of Python.
+Ask questions about your own PDF library in natural language, get **cited** answers, **fully offline** — nothing leaves your machine. **Hybrid retrieval (dense + sparse) with cross-encoder reranking**, ~200 lines of Python.
 
 Built for researchers who can't (or won't) send their corpus to a cloud API. Runs on a single modest GPU, or CPU-only.
 
