@@ -18,7 +18,8 @@ Quick start:
   python rag.py ask "your question"
 
 Config via env (all optional):
-  OLLAMA_URL  (default http://127.0.0.1:11434)  — point at any host running Ollama
+  OLLAMA_URL  (default http://127.0.0.1:11434)  — Ollama serving the LLM
+  RAG_EMBED_URL (default = OLLAMA_URL)          — Ollama serving embeddings (can be a different box)
   RAG_EMBED   (default bge-m3)
   RAG_LLM     (default qwen3:8b)
   RAG_DB      (default ./rag_qdrant)
@@ -37,6 +38,7 @@ from qdrant_client.models import (Distance, VectorParams, SparseVectorParams,
     PointStruct, SparseVector, Prefetch, FusionQuery, Fusion)
 
 OLLAMA       = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
+EMBED_URL    = os.environ.get("RAG_EMBED_URL", OLLAMA)        # embeddings can target a different Ollama than the LLM
 EMBED_MODEL  = os.environ.get("RAG_EMBED", "bge-m3")          # 1024-dim, multilingual
 LLM_MODEL    = os.environ.get("RAG_LLM",   "qwen3:8b")        # any Ollama chat model
 QDRANT_PATH  = os.environ.get("RAG_DB",    "./rag_qdrant")
@@ -71,8 +73,8 @@ def _sv(o):                                       # fastembed sparse output -> Q
     return SparseVector(indices=[int(i) for i in o.indices], values=[float(v) for v in o.values])
 
 
-def _post(path, payload, timeout=600):
-    req = urllib.request.Request(OLLAMA + path, data=json.dumps(payload).encode(),
+def _post(path, payload, base=None, timeout=600):
+    req = urllib.request.Request((base or OLLAMA) + path, data=json.dumps(payload).encode(),
                                  headers={"Content-Type": "application/json"}, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
@@ -83,7 +85,7 @@ def embed(texts, tries=3):
         texts = [texts]
     for k in range(tries):                       # embedders can stall under load; fail fast + retry, don't hang
         try:
-            return _post("/api/embed", {"model": EMBED_MODEL, "input": texts}, timeout=EMBED_TIMEOUT)["embeddings"]
+            return _post("/api/embed", {"model": EMBED_MODEL, "input": texts}, base=EMBED_URL, timeout=EMBED_TIMEOUT)["embeddings"]
         except Exception as e:
             if k == tries - 1:
                 raise SystemExit(
@@ -215,7 +217,12 @@ def stats():
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
-    if cmd == "ingest":   ingest(sys.argv[2:])
-    elif cmd == "ask":    ask(" ".join(sys.argv[2:]))
-    elif cmd == "stats":  stats()
-    else:                 print(__doc__)
+    try:
+        if cmd == "ingest":   ingest(sys.argv[2:])
+        elif cmd == "ask":    ask(" ".join(sys.argv[2:]))
+        elif cmd == "stats":  stats()
+        else:                 print(__doc__)
+    finally:
+        if _qc is not None:                          # close the embedded DB cleanly (avoids a noisy __del__ at exit)
+            try: _qc.close()
+            except Exception: pass

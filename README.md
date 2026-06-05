@@ -96,7 +96,8 @@ Your corpus never leaves the machine — only the tool calls and answers cross t
 
 | Var | Default | |
 |---|---|---|
-| `OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama endpoint |
+| `OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama serving the **LLM** |
+| `RAG_EMBED_URL` | = `OLLAMA_URL` | Ollama serving **embeddings** (can be a different box) |
 | `RAG_EMBED` | `bge-m3` | embedding model |
 | `RAG_LLM` | `qwen3:8b` | any Ollama chat model |
 | `RAG_DB` | `./rag_qdrant` | vector DB folder |
@@ -104,6 +105,22 @@ Your corpus never leaves the machine — only the tool calls and answers cross t
 | `RAG_SPARSE` | `Qdrant/bm25` | fastembed sparse model |
 | `RAG_NUM_CTX` | `8192` | LLM context cap — keeps big-native-context models fully on-GPU instead of spilling KV cache to CPU |
 | `RAG_EMBED_TIMEOUT` | `120` | seconds before an embed request is retried |
+
+## Two-machine setup (optional)
+
+Split the heavy and the interactive work across boxes — e.g. a fast 24 GB GPU for the LLM, and a cheaper/older box (or plain CPU) for embedding, which is steadier under a long ingest:
+
+```bash
+# Ingest where the DB lives — embeddings on CPU / an old GPU (stable):
+RAG_EMBED=bge-m3-cpu python rag.py ingest ./papers
+
+# Serve: LLM on the fast GPU box, embeddings still on the local/cheap box:
+OLLAMA_URL=http://gpu-box:11434      RAG_LLM=qwen3:27b    \
+RAG_EMBED_URL=http://127.0.0.1:11434 RAG_EMBED=bge-m3-cpu \
+python mcp_server.py
+```
+
+`RAG_EMBED_URL` points embeddings at a different Ollama than `OLLAMA_URL` (the LLM). Dense vectors are defined by the model, so any box running the same `bge-m3` produces compatible vectors — you can even ingest on one box and serve from another. `RAG_DB` is the index folder (embedded Qdrant is a local directory; keep it where you ingest and serve).
 
 ## Notes from building it (the things that bit me)
 
