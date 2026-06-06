@@ -5,6 +5,8 @@ Ask questions about your own PDF library in natural language, get **cited** answ
 Built for researchers who can't (or won't) send their corpus to a cloud API. Runs on a single modest GPU, or CPU-only.
 
 > The capstone project of [**Local LLMs for Researchers**](https://github.com/shoo99/local-llm-for-researchers).
+>
+> 📝 **The full story** — building this across old + new GPUs, and the 3 gotchas (CPU embeddings, the context trap, and not merging GPUs): [the writeup on bric.pe.kr](https://bric.pe.kr/blog/fully-local-paper-rag-1080ti-3090-hybrid-rerank-mcp).
 
 ## Why
 
