@@ -26,6 +26,9 @@ Config via env (all optional):
   RAG_RERANK  (default Xenova/ms-marco-MiniLM-L-6-v2) — any fastembed cross-encoder
   RAG_SPARSE  (default Qdrant/bm25)
   RAG_NUM_CTX (default 8192)  — caps the LLM context so big-native-context models stay on-GPU
+  RAG_CTX_BUDGET (default 6000) — char budget for context sent to the LLM (fewer, better tokens -> cheaper prefill)
+  RAG_DEDUP   (default 1)       — drop near-duplicate passages before answering (set 0 to disable)
+  RAG_RANK_K  (default 12)      — passages reranked, then deduped + budget-filled down to what fits
   RAG_EMBED_TIMEOUT (default 120)
 
 Ingest is resumable: progress is saved per batch, so re-running picks up where it stopped.
@@ -50,6 +53,9 @@ COLLECTION   = "papers"
 DIM          = 1024
 CHUNK, OVERLAP, BATCH = 1400, 200, 16
 PREFETCH, TOPK = 20, 5          # hybrid candidate pool -> rerank -> passages sent to the LLM
+CTX_BUDGET   = int(os.environ.get("RAG_CTX_BUDGET", "6000"))  # char budget for LLM context: fewer, better tokens -> cheaper prefill
+RANK_K       = int(os.environ.get("RAG_RANK_K", "12"))        # rerank a wider pool, then dedup + budget-fill it down
+DEDUP        = os.environ.get("RAG_DEDUP", "1") != "0"
 DENSE, SPARSE  = "dense", "sparse"
 
 # Optional hybrid (sparse retrieval + cross-encoder rerank); degrade to dense-only if absent.
@@ -186,9 +192,47 @@ def retrieve(question, k=TOPK):
              "page": h.payload["page"], "score": round(float(s), 4)} for h, s in ranked]
 
 
+def _shingles(text, n=5):                         # word 5-grams, for cheap near-duplicate detection
+    w = re.sub(r"\s+", " ", text.lower()).split()
+    return {" ".join(w[i:i + n]) for i in range(max(1, len(w) - n + 1))}
+
+
+def _dedup(hits, thr=0.7):
+    """Drop near-duplicate passages (one largely contained in an already-kept one), keeping rerank order.
+    Uses a containment coefficient (overlap / smaller passage) so a near-superset is caught, while
+    merely adjacent chunks that share a little overlap are kept."""
+    kept, seen = [], []
+    for h in hits:
+        s = _shingles(h["text"])
+        if s and any(len(s & k) / min(len(s), len(k)) >= thr for k in seen):   # containment vs a kept passage
+            continue
+        kept.append(h); seen.append(s)
+    return kept
+
+
+def _fit_budget(hits, budget):
+    """Greedily keep top passages until the char budget is hit — fewer, better tokens -> cheaper prefill."""
+    out, used = [], 0
+    for h in hits:
+        if out and used + len(h["text"]) > budget:
+            break
+        out.append(h); used += len(h["text"])
+        if used >= budget:
+            break
+    return out
+
+
+def curate(question):
+    """Retrieve a wide pool, drop near-duplicates, and keep only what fits the context budget."""
+    hits = retrieve(question, k=RANK_K)
+    if DEDUP:
+        hits = _dedup(hits)
+    return _fit_budget(hits, CTX_BUDGET)
+
+
 def answer(question):
     """Retrieve, then have the local LLM answer with [n] citations. Returns {'answer': str, 'sources': [...]}."""
-    hits = retrieve(question)
+    hits = curate(question)                       # wide rerank -> dedup -> budget-fit (the working set)
     if not hits:
         return {"answer": "No matches - ingest some PDFs first.", "sources": []}
     ctx = "\n\n".join(f"[{i+1}] ({h['source']} p.{h['page']}) {h['text']}" for i, h in enumerate(hits))
